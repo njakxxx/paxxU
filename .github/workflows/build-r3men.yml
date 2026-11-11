@@ -88,7 +88,7 @@ jobs:
           SM_FULL=$(sed -n 's/^FIRMWARE_FILE=U1_\([0-9.]*\)_.*/\1/p' fw/vars.mk)
           [ -n "$SM_FULL" ] || { echo "Snapmaker-Version nicht in vars.mk gefunden"; exit 1; }
           N="${TAG##*-}"                       # v2.0.0-paxx12-24 -> 24
-          VER="${SM_FULL}-paxx12-${N}-r3men"   # 2.0.0.205-paxx12-24-r3men
+          VER="paxxU-${SM_FULL}-paxx12-${N}-r3men"   # paxxU-2.0.0.205-paxx12-24-r3men
           echo "Snapmaker $SM_FULL, paxx12-Build $N -> $VER"
           { echo "SM_FULL=$SM_FULL"; echo "VER=$VER"; echo "BIN=U1_${VER}_upgrade.bin"; } >> "$GITHUB_ENV"
 

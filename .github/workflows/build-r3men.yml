@@ -82,6 +82,16 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Version bestimmen (Snapmaker-Basis + paxx12-Build)
+        run: |
+          set -euo pipefail
+          SM_FULL=$(sed -n 's/^FIRMWARE_FILE=U1_\([0-9.]*\)_.*/\1/p' fw/vars.mk)
+          [ -n "$SM_FULL" ] || { echo "Snapmaker-Version nicht in vars.mk gefunden"; exit 1; }
+          N="${TAG##*-}"                       # v2.0.0-paxx12-24 -> 24
+          VER="${SM_FULL}-paxx12-${N}-r3men"   # 2.0.0.205-paxx12-24-r3men
+          echo "Snapmaker $SM_FULL, paxx12-Build $N -> $VER"
+          { echo "SM_FULL=$SM_FULL"; echo "VER=$VER"; echo "BIN=U1_${VER}_upgrade.bin"; } >> "$GITHUB_ENV"
+
       - name: R3men-Mod einhängen
         run: |
           set -euo pipefail
@@ -99,10 +109,9 @@ jobs:
         working-directory: fw
         env:
           CI: "true"
-          GIT_VERSION: ${{ needs.check.outputs.own }}
         run: |
-          ./dev.sh make build PROFILE=extended-$MOD_NAME \
-            OUTPUT_FILE=U1_extended_${OWN#v}_upgrade.bin
+          export GIT_VERSION="v$VER"           # erscheint am Drucker als Firmware-Version
+          ./dev.sh make build PROFILE=extended-$MOD_NAME OUTPUT_FILE="$BIN"
 
       - name: Gegenprobe im gebauten Rootfs
         working-directory: fw
@@ -116,9 +125,8 @@ jobs:
       - name: Release-Notes
         working-directory: fw
         run: |
-          BIN=U1_extended_${OWN#v}_upgrade.bin
           {
-            echo "paxx12 **${TAG}** + R3men Graphite Heated Bed (Snapmaker U1)"
+            echo "**${VER}** – Snapmaker-Basis **${SM_FULL}**, paxx12 **${TAG}**, + R3men Graphite Heated Bed"
             echo
             echo "Upstream-Release: https://github.com/${UPSTREAM}/releases/tag/${TAG}"
             echo
@@ -141,10 +149,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          BIN=U1_extended_${OWN#v}_upgrade.bin
+          sha256sum "$BIN" > "$BIN.sha256"
           gh release delete "$OWN" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$OWN" "$BIN" -R "$GITHUB_REPOSITORY" \
-            --title "$OWN" --notes-file notes.md --target "${{ github.sha }}"
+          gh release create "$OWN" "$BIN" "$BIN.sha256" -R "$GITHUB_REPOSITORY" \
+            --title "$VER" --notes-file notes.md --target "${{ github.sha }}"
 
       - name: Push-Benachrichtigung (optional, ntfy)
         if: env.NTFY_TOPIC != ''
@@ -152,7 +160,7 @@ jobs:
           NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
         run: |
           curl -fsS \
-            -H "Title: Neue U1-Firmware: $OWN" \
+            -H "Title: Neue U1-Firmware: $VER" \
             -H "Tags: printer" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$OWN" \
             -d "paxx12 $TAG + R3men Bed ist gebaut und bereit zum Download." \

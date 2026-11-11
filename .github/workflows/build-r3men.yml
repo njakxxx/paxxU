@@ -1,0 +1,159 @@
+name: paxx12 + R3men Bed Firmware
+
+# Prüft regelmäßig, ob paxx12 ein neues Release veröffentlicht hat.
+# Wenn ja: Quellcode dieses Releases holen, eigenes Mod-Overlay (R3men Bed) einhängen,
+# Firmware bauen und als Release in DIESEM Repo veröffentlichen (inkl. .bin zum Download).
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"          # alle 6 Stunden (UTC)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "paxx12-Tag erzwingen (z. B. v2.0.0-paxx12-24), leer = neuestes Release"
+        required: false
+        default: ""
+      force:
+        description: "Auch bauen, wenn es das Release schon gibt"
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM: paxx12-snapmaker-u1/SnapmakerU1-Extended-Firmware
+  MOD_NAME: njakxxx                 # Ordnername unter overlays/mods/ (kein Bindestrich!)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: r3men-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.up.outputs.tag }}
+      own: ${{ steps.up.outputs.own }}
+      build: ${{ steps.up.outputs.build }}
+    steps:
+      - id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          TAG="${IN_TAG:-}"
+          if [ -z "$TAG" ]; then
+            # neuestes veröffentlichtes Release (keine Drafts, Pre-Releases zählen mit)
+            TAG=$(gh api "repos/$UPSTREAM/releases?per_page=20" \
+                  --jq '[.[] | select(.draft == false)][0].tag_name')
+          fi
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "Kein Upstream-Release gefunden"; exit 1; }
+          OWN="${TAG}-r3men"
+          BUILD=true
+          if gh release view "$OWN" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${FORCE:-false}" != "true" ]; then
+            BUILD=false
+          fi
+          echo "Upstream: $TAG -> eigenes Release: $OWN, bauen: $BUILD"
+          { echo "tag=$TAG"; echo "own=$OWN"; echo "build=$BUILD"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm          # Build-Container ist ARM64 (wie bei paxx12)
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      OWN: ${{ needs.check.outputs.own }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}   # optional: Repo-Secret für Push aufs Handy
+    steps:
+      - name: Eigenes Repo (Mod) auschecken
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: paxx12-Quellcode des Releases auschecken
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+          path: fw
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: R3men-Mod einhängen
+        run: |
+          set -euo pipefail
+          DEST="fw/overlays/mods/$MOD_NAME"
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          cp -a self/mod/. "$DEST/"
+          chmod +x "$DEST"/*/scripts/*.sh
+          find "$DEST" -type f | sort
+
+      - name: Basis-Firmware von Snapmaker laden
+        working-directory: fw
+        run: ./dev.sh make firmware
+
+      - name: Firmware bauen (PROFILE=extended-${{ env.MOD_NAME }})
+        working-directory: fw
+        env:
+          CI: "true"
+          GIT_VERSION: ${{ needs.check.outputs.own }}
+        run: |
+          ./dev.sh make build PROFILE=extended-$MOD_NAME \
+            OUTPUT_FILE=U1_extended_${OWN#v}_upgrade.bin
+
+      - name: Gegenprobe im gebauten Rootfs
+        working-directory: fw
+        run: |
+          set -euo pipefail
+          CFG=tmp/firmware/rootfs/home/lava/origin_printer_data/config/printer.cfg
+          sudo awk '/^\[thermistor R3men_bed\]/,/^max_temp_overshoot/' "$CFG" | tee r3men_section.txt
+          sudo grep -A3 '^\[stepper_z\]' "$CFG" || true
+          sudo grep -q '^sensor_type: R3men_bed' "$CFG"
+
+      - name: Release-Notes
+        working-directory: fw
+        run: |
+          BIN=U1_extended_${OWN#v}_upgrade.bin
+          {
+            echo "paxx12 **${TAG}** + R3men Graphite Heated Bed (Snapmaker U1)"
+            echo
+            echo "Upstream-Release: https://github.com/${UPSTREAM}/releases/tag/${TAG}"
+            echo
+            echo "SHA256: \`$(sha256sum "$BIN" | cut -d' ' -f1)\`"
+            echo
+            echo "Installation: .bin auf FAT32-USB-Stick -> Settings > About > Firmware Version > Local Update"
+            echo
+            echo "Nach dem Flashen in Snapmaker Orca die Druckhöhe auf 260 mm setzen (falls noch nicht geschehen)."
+            echo
+            echo '<details><summary>Eingespielte Konfiguration</summary>'
+            echo
+            echo '```ini'
+            cat r3men_section.txt
+            echo '```'
+            echo '</details>'
+          } > notes.md
+
+      - name: Release veröffentlichen
+        working-directory: fw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BIN=U1_extended_${OWN#v}_upgrade.bin
+          gh release delete "$OWN" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$OWN" "$BIN" -R "$GITHUB_REPOSITORY" \
+            --title "$OWN" --notes-file notes.md --target "${{ github.sha }}"
+
+      - name: Push-Benachrichtigung (optional, ntfy)
+        if: env.NTFY_TOPIC != ''
+        env:
+          NTFY_SERVER: ${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}
+        run: |
+          curl -fsS \
+            -H "Title: Neue U1-Firmware: $OWN" \
+            -H "Tags: printer" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$OWN" \
+            -d "paxx12 $TAG + R3men Bed ist gebaut und bereit zum Download." \
+            "$NTFY_SERVER/$NTFY_TOPIC"
